@@ -1,3 +1,4 @@
+import asyncio
 import os
 import random
 import threading
@@ -100,6 +101,7 @@ def run_server():
 
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
+    asyncio.set_event_loop(asyncio.new_event_loop())  # Python 3.14 fix
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
     app.run_polling()
