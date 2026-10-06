@@ -1,22 +1,24 @@
 import asyncio
+import logging
 import os
 import random
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from google import genai
-from google.genai import types
+import httpx
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
-# ---------- Config (key/token Render er Environment Variables e dibe) ----------
+logging.basicConfig(level=logging.INFO)
+
+# ---------- Config (Render er Environment Variables e dibe) ----------
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-MODEL = "gemini-2.5-flash"
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 CHANNEL_LINK = "https://t.me/+7I1XRZaCYYg1MzU1"
-PROMO_EVERY = 5      # prati 5ta reply te 1 bar channel promo
-MAX_TURNS = 12       # koto ta purono message mone rakhbe
+PROMO_EVERY = 5
+MAX_TURNS = 12
 
 SYSTEM_PROMPT = """
 তুমি একজন মিষ্টি, flirty, রোমান্টিক girlfriend। নাম "Riya"।
@@ -34,49 +36,51 @@ PROMO_LINES = [
     "শুনো না জান, channel এ join করে নাও, আমি অপেক্ষা করছি 😘 {link}",
 ]
 
-client = genai.Client(api_key=GEMINI_API_KEY)
-history = {}      # chat_id -> list of contents
-reply_count = {}  # chat_id -> count
+history = {}
+reply_count = {}
+http = httpx.AsyncClient(timeout=30)
+
+
+async def ask_ai(messages):
+    r = await http.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+        json={
+            "model": MODEL,
+            "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+            "max_tokens": 300,
+            "temperature": 1.0,
+        },
+    )
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"].strip()
 
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
-    if not msg or not msg.text or not user:
-        return
-    if user.is_bot:  # onno bot ke reply korbe na
+    print("GOT MESSAGE:", update.effective_chat.type, msg.text if msg else None, flush=True)
+    if not msg or not msg.text or not user or user.is_bot:
         return
 
     chat_id = update.effective_chat.id
 
-    # keu video/channel likhle sorasori link
     if any(w in msg.text.lower() for w in ["video", "channel"]):
         await msg.reply_text(f"এই নাও জান 😘 আমার Video Channel: {CHANNEL_LINK}")
         return
 
-    text = f"{user.first_name}: {msg.text}"
     h = history.setdefault(chat_id, [])
-    h.append(types.Content(role="user", parts=[types.Part(text=text)]))
+    h.append({"role": "user", "content": f"{user.first_name}: {msg.text}"})
     h[:] = h[-MAX_TURNS * 2:]
 
     try:
-        resp = await client.aio.models.generate_content(
-            model=MODEL,
-            contents=h,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                max_output_tokens=300,
-                temperature=1.0,
-            ),
-        )
-        reply = (resp.text or "").strip() or "hmm jan, bujhlam na 🥺"
+        reply = await ask_ai(h) or "hmm jan, bujhlam na 🥺"
     except Exception as e:
-        print("Gemini error:", e)
+        print("AI error:", e, flush=True)
         return
 
-    h.append(types.Content(role="model", parts=[types.Part(text=reply)]))
+    h.append({"role": "assistant", "content": reply})
 
-    # prati PROMO_EVERY ta reply te channel promo
     reply_count[chat_id] = reply_count.get(chat_id, 0) + 1
     if reply_count[chat_id] % PROMO_EVERY == 0:
         reply += "\n\n" + random.choice(PROMO_LINES).format(link=CHANNEL_LINK)
@@ -84,7 +88,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(reply)
 
 
-# ---------- Render er jonno choto health server ----------
 class Ping(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -101,7 +104,12 @@ def run_server():
 
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
-    asyncio.set_event_loop(asyncio.new_event_loop())  # Python 3.14 fix
+    asyncio.set_event_loop(asyncio.new_event_loop())
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
-    app.run_polling()
+
+    async def on_error(update, context):
+        print("TELEGRAM ERROR:", context.error, flush=True)
+
+    app.add_error_handler(on_error)
+    app.run_polling(drop_pending_updates=True)
